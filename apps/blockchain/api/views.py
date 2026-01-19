@@ -1,12 +1,15 @@
 import hashlib
 import uuid
+import jwt
+from datetime import datetime, timedelta
+from django.conf import settings
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
-from ..models import Investigation, Evidence, Tag, InvestigationTag, InvestigationNote, GUIDMapping, BlockchainTransaction
-from .serializers import InvestigationSerializer, EvidenceSerializer, TagSerializer, InvestigationNoteSerializer, GUIDMappingSerializer
+from ..models import Investigation, Evidence, AcquisitionEvent, Tag, InvestigationTag, InvestigationNote, GUIDMapping, BlockchainTransaction
+from .serializers import InvestigationSerializer, EvidenceSerializer, AcquisitionEventSerializer, TagSerializer, InvestigationNoteSerializer, GUIDMappingSerializer
 
 def mock_upload_to_ipfs(file_content):
     """Mock IPFS upload - returns fake CID"""
@@ -56,6 +59,89 @@ class InvestigationViewSet(viewsets.ModelViewSet):
         for tag_id in tag_ids:
             InvestigationTag.objects.create(investigation=investigation, tag_id=tag_id)
 
+class AcquisitionEventViewSet(viewsets.ModelViewSet):
+    """
+    API endpoint for registering evidence acquisition events.
+    Used by forensic tools to create Chain of Custody records at acquisition time.
+    """
+    queryset = AcquisitionEvent.objects.all()
+    serializer_class = AcquisitionEventSerializer
+    permission_classes = [IsAuthenticated]
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ['status', 'case_number', 'evidence_hash']
+
+    def get_queryset(self):
+        user = self.request.user
+        # Auditors and Court can see all
+        if user.role_bindings.filter(role__name__in=['Auditor', 'Court']).exists() or user.is_superuser:
+            return AcquisitionEvent.objects.all()
+        # Investigators see their own
+        return AcquisitionEvent.objects.filter(investigator=user)
+
+    def perform_create(self, serializer):
+        # Create acquisition event
+        acquisition_event = serializer.save(investigator=self.request.user)
+
+        # Create blockchain transaction
+        tx_hash, block = mock_blockchain_transaction(
+            'acquisition_event',
+            {
+                'acquisition_event_id': str(acquisition_event.id),
+                'evidence_hash': acquisition_event.evidence_hash,
+                'tool_name': acquisition_event.tool_name,
+                'tool_version': acquisition_event.tool_version,
+                'acquisition_timestamp': acquisition_event.acquisition_timestamp.isoformat(),
+                'device_make': acquisition_event.device_make,
+                'device_model': acquisition_event.device_model,
+            },
+            self.request.user
+        )
+
+        # Generate receipt token (JWT)
+        secret_key = getattr(settings, 'SECRET_KEY', 'default-secret-key')
+        receipt_payload = {
+            'acquisition_event_id': str(acquisition_event.id),
+            'evidence_hash': acquisition_event.evidence_hash,
+            'blockchain_tx_hash': tx_hash,
+            'blockchain_block': block,
+            'investigator': self.request.user.username,
+            'acquisition_timestamp': acquisition_event.acquisition_timestamp.isoformat(),
+            'issued_at': datetime.utcnow().isoformat(),
+            'expires_at': (datetime.utcnow() + timedelta(days=365)).isoformat(),
+        }
+        receipt_token = jwt.encode(receipt_payload, secret_key, algorithm='HS256')
+
+        # Update acquisition event with blockchain info and receipt
+        acquisition_event.blockchain_tx_hash = tx_hash
+        acquisition_event.blockchain_block = block
+        acquisition_event.receipt_token = receipt_token
+        acquisition_event.save()
+
+    @action(detail=True, methods=['get'])
+    def verify(self, request, pk=None):
+        """Verify an acquisition event and return full details"""
+        acquisition_event = self.get_object()
+
+        # Verify receipt token if provided
+        receipt_token = request.query_params.get('receipt_token')
+        if receipt_token:
+            try:
+                secret_key = getattr(settings, 'SECRET_KEY', 'default-secret-key')
+                decoded = jwt.decode(receipt_token, secret_key, algorithms=['HS256'])
+                if str(acquisition_event.id) != decoded.get('acquisition_event_id'):
+                    return Response({'error': 'Receipt token does not match acquisition event'},
+                                  status=status.HTTP_400_BAD_REQUEST)
+            except jwt.InvalidTokenError:
+                return Response({'error': 'Invalid receipt token'},
+                              status=status.HTTP_400_BAD_REQUEST)
+
+        serializer = self.get_serializer(acquisition_event)
+        return Response({
+            'verified': True,
+            'acquisition_event': serializer.data,
+            'blockchain_verified': bool(acquisition_event.blockchain_tx_hash),
+        })
+
 class EvidenceViewSet(viewsets.ModelViewSet):
     queryset = Evidence.objects.all()
     serializer_class = EvidenceSerializer
@@ -70,25 +156,45 @@ class EvidenceViewSet(viewsets.ModelViewSet):
     def create(self, request, *args, **kwargs):
         # Get form data
         investigation_id = request.data.get('investigation')
+        acquisition_event_id = request.data.get('acquisition_event_id')
         title = request.data.get('title')
         description = request.data.get('description', '')
         uploaded_anonymously = request.data.get('uploaded_anonymously', 'false').lower() == 'true'
         file_obj = request.FILES.get('file')
-        
+
         if not file_obj:
             return Response({'error': 'No file provided'}, status=status.HTTP_400_BAD_REQUEST)
-        
+
         if not investigation_id or not title:
             return Response({'error': 'investigation and title are required'}, status=status.HTTP_400_BAD_REQUEST)
-        
+
         # Read and process file
         file_content = file_obj.read()
         file_hash = hashlib.sha256(file_content).hexdigest()
         ipfs_hash = mock_upload_to_ipfs(file_content)
-        
+
+        # Check for matching acquisition event
+        acquisition_event = None
+        if acquisition_event_id:
+            try:
+                acquisition_event = AcquisitionEvent.objects.get(id=acquisition_event_id)
+                # Verify hash matches
+                if acquisition_event.evidence_hash != file_hash:
+                    return Response({
+                        'error': 'File hash does not match acquisition event hash',
+                        'expected': acquisition_event.evidence_hash,
+                        'actual': file_hash
+                    }, status=status.HTTP_400_BAD_REQUEST)
+                # Update acquisition event status
+                acquisition_event.status = 'uploaded'
+                acquisition_event.save()
+            except AcquisitionEvent.DoesNotExist:
+                return Response({'error': 'Acquisition event not found'}, status=status.HTTP_404_NOT_FOUND)
+
         # Create evidence
         evidence = Evidence.objects.create(
             investigation_id=investigation_id,
+            acquisition_event=acquisition_event,
             title=title,
             description=description,
             file_name=file_obj.name,

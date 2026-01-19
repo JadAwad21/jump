@@ -26,9 +26,64 @@ class Investigation(models.Model):
         db_table = 'blockchain_investigation'
         ordering = ['-created_at']
 
+class AcquisitionEvent(models.Model):
+    """Records evidence acquisition at the point of capture (before upload)"""
+    STATUS_CHOICES = [
+        ('recorded', 'Recorded'),
+        ('uploaded', 'Uploaded'),
+        ('verified', 'Verified'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    evidence_hash = models.CharField(max_length=64, unique=True, db_index=True)
+    acquisition_timestamp = models.DateTimeField()
+
+    # Source device metadata
+    device_make = models.CharField(max_length=100, blank=True)
+    device_model = models.CharField(max_length=100, blank=True)
+    device_serial = models.CharField(max_length=255, blank=True)
+    storage_id = models.CharField(max_length=255, blank=True)
+    device_metadata = models.JSONField(default=dict, blank=True)
+
+    # Acquisition tool information
+    tool_name = models.CharField(max_length=100)
+    tool_version = models.CharField(max_length=50)
+    tool_verification_hash = models.CharField(max_length=64, blank=True)
+    tool_metadata = models.JSONField(default=dict, blank=True)
+
+    # Investigator and case info
+    investigator = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='acquisitions')
+    case_number = models.CharField(max_length=100, blank=True)
+    notes = models.TextField(blank=True)
+
+    # Blockchain record
+    blockchain_tx_hash = models.CharField(max_length=66, blank=True, null=True)
+    blockchain_block = models.IntegerField(blank=True, null=True)
+
+    # Receipt token for verification
+    receipt_token = models.TextField(blank=True)
+
+    # Status tracking
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='recorded')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'blockchain_acquisition_event'
+        ordering = ['-acquisition_timestamp']
+        indexes = [
+            models.Index(fields=['evidence_hash']),
+            models.Index(fields=['case_number']),
+            models.Index(fields=['acquisition_timestamp']),
+        ]
+
+    def __str__(self):
+        return f"Acquisition {self.id} - {self.tool_name} - {self.acquisition_timestamp}"
+
 class Evidence(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     investigation = models.ForeignKey(Investigation, on_delete=models.CASCADE, related_name='evidence')
+    acquisition_event = models.ForeignKey(AcquisitionEvent, on_delete=models.SET_NULL, null=True, blank=True, related_name='evidence')
     title = models.CharField(max_length=255)
     description = models.TextField(blank=True)
     file_name = models.CharField(max_length=255)
@@ -42,7 +97,7 @@ class Evidence(models.Model):
     uploaded_anonymously = models.BooleanField(default=False)
     anonymous_guid = models.UUIDField(null=True, blank=True)
     uploaded_at = models.DateTimeField(auto_now_add=True)
-    
+
     class Meta:
         db_table = 'blockchain_evidence'
         ordering = ['-uploaded_at']
