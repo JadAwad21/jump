@@ -8,7 +8,7 @@ export default defineConfig({
     host: true,
     proxy: {
       '/api': {
-        target: 'http://192.168.121.132:8080',
+        target: 'http://localhost:8080',
         changeOrigin: true,
         secure: false,
         // Fix the incorrect /users/me endpoint the frontend uses
